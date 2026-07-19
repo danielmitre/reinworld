@@ -1,6 +1,10 @@
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
 use std::sync::LazyLock;
+
+use futures_util::StreamExt;
+use actix_web::{App, Error, HttpRequest, HttpResponse, HttpServer, body::MessageBody, web};
+use actix_ws::Message;
+
+mod msg;
 
 const HEIGHT: usize = 30;
 const WIDTH: usize = 80;
@@ -56,21 +60,48 @@ impl Map {
 
 static MAP: LazyLock<Map> = LazyLock::new(|| Map::generate());
 
-fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
-    let mut buffer = [0; 512];
-    stream.read(&mut buffer)?;
-    println!("Received request: {}", String::from_utf8_lossy(&buffer));
-    stream.write_all(MAP.render().as_bytes())?;
-    stream.flush()
+async fn ws_map(req: HttpRequest, stream: web::Payload) -> Result<HttpResponse, Error> {
+    let (response, mut session, mut msg_stream) = actix_ws::handle(&req, stream)?;
+
+    actix_web::rt::spawn(async move {
+        while let Some(Ok(msg)) = msg_stream.next().await {
+            match msg {
+                Message::Ping(bytes) => {
+                    let _ = session.pong(&bytes).await;
+                }
+                Message::Binary(bytes) => {
+                    match msg::Msg::from(bytes.to_vec()) {
+                        msg::Msg::GetMap => {
+                            let _ = session.text(MAP.render()).await;
+                        }
+                        msg::Msg::Move(dir) => {
+                            eprintln!("move {dir:?}")
+                        }
+                        msg::Msg::Unknown => {
+                            eprintln!("Unknown message type, skipping");
+                        }
+                    }
+                }
+                Message::Close(reason) => {
+                    let _ = session.close(reason).await;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+
+    Ok(response)
 }
 
-fn main() -> std::io::Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:7878").expect("failed to bind TCP listener");
-    println!("listening on 127.0.0.1:7878");
-    for stream in listener.incoming() {
-        handle_connection(stream?)?;
-    }
-    Ok(())
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    println!("listening on http://127.0.0.1:8080/ws");
+
+    HttpServer::new(|| App::new().route("/ws", web::get().to(ws_map)))
+        .bind(("127.0.0.1", 8080))?
+        .run()
+        .await
 }
 
 #[cfg(test)]
